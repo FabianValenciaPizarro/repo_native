@@ -1,0 +1,21 @@
+# Logs
+*.log
+
+# Dependencies
+node_modules/
+target/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+*.suo
+*.user
+
+# Data
+data/
+
+# Docker compose
+.env

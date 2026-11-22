@@ -1,0 +1,566 @@
+import { useState, useEffect } from 'react';
+import { useAuth } from './auth/useAuth';
+import type { Product } from './types/product';
+import type { Order } from './types/order';
+import type { Shipment } from './types/shipping';
+import { productService } from './services/productService';
+import { orderService } from './services/orderService';
+import { shippingService } from './services/shippingService';
+import { inventoryService } from './services/inventoryService';
+import { Navbar } from './components/Navbar';
+import { ProductList } from './components/ProductList';
+import { ProductForm } from './components/ProductForm';
+import { ShippingTracker } from './components/ShippingTracker';
+import narutoImage from './assets/homeimages/naruto.png';
+import cloudMain from './assets/homeimages/cloud_6.png';
+import cloudLeft from './assets/homeimages/cloud_4.png';
+import cloudRight from './assets/homeimages/cloud_12.png';
+import cloudPass1 from './assets/homeimages/cloud_2.png';
+import cloudPass2 from './assets/homeimages/cloud_10.png';
+import './index.css';
+
+export function App() {
+  const auth = useAuth();
+  const [products, setProducts] = useState<Product[]>([]);
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [stockByProduct, setStockByProduct] = useState<Record<number, number>>({});
+  const [shipmentsByOrder, setShipmentsByOrder] = useState<Record<number, Shipment>>({});
+  const [selectedTrackingNumber, setSelectedTrackingNumber] = useState<string | undefined>(undefined);
+
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isLoadingOrders, setIsLoadingOrders] = useState<boolean>(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [triBrokerNotice, setTriBrokerNotice] = useState<{
+    orderId: number;
+    productName: string;
+    trackingNumber: string;
+  } | null>(null);
+
+  // Control de pantalla: 'inicio' | 'tienda' | 'pedidos' | 'envios' | 'inventario'
+  const [pagina, setPagina] = useState<'inicio' | 'tienda' | 'pedidos' | 'envios' | 'inventario'>('inicio');
+
+  // El access_token es el que autoriza contra la API; el id_token queda como fallback
+  const userToken = auth.user?.access_token || auth.user?.id_token;
+
+  const fetchProducts = async () => {
+    try {
+      setIsLoading(true);
+      setErrorMessage(null);
+      const data = await productService.getAll();
+      setProducts(data);
+    } catch (err: any) {
+      setErrorMessage('No se pudo conectar con el Backend en Render (https://soluciones-cloud-v1.onrender.com). Asegúrate de que el servicio haya terminado de desplegar.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const fetchStock = async () => {
+    try {
+      const items = await inventoryService.getAll();
+      if (items.length > 0) {
+        const map: Record<number, number> = {};
+        items.forEach((item) => {
+          map[item.productId] = item.stock;
+        });
+        setStockByProduct(map);
+      }
+    } catch (e) {
+      console.warn('Aviso al obtener stock de inventory-service:', e);
+    }
+  };
+
+  const fetchOrders = async () => {
+    if (!auth.isAuthenticated || !userToken) return;
+    try {
+      setIsLoadingOrders(true);
+      const data = await orderService.getMyOrders(userToken);
+      setOrders(data);
+      // Cargar despachos de LavinMQ para estas órdenes
+      loadShipmentsForOrders(data);
+    } catch (err: any) {
+      console.warn('Aviso al consultar órdenes:', err);
+    } finally {
+      setIsLoadingOrders(false);
+    }
+  };
+
+  const loadShipmentsForOrders = async (orderList: Order[]) => {
+    const promises = orderList.map(async (o) => {
+      if (!o.id) return null;
+      try {
+        const shipment = await shippingService.getByOrderId(o.id);
+        return shipment ? { orderId: o.id, shipment } : null;
+      } catch {
+        return null;
+      }
+    });
+
+    const results = await Promise.all(promises);
+    setShipmentsByOrder((prev) => {
+      const updated = { ...prev };
+      results.forEach((r) => {
+        if (r) updated[r.orderId] = r.shipment;
+      });
+      return updated;
+    });
+  };
+
+  useEffect(() => {
+    fetchProducts();
+    fetchStock();
+  }, []);
+
+  useEffect(() => {
+    if (pagina === 'tienda') {
+      fetchStock();
+    }
+    if (pagina === 'pedidos' && auth.isAuthenticated) {
+      fetchOrders();
+    }
+  }, [pagina, auth.isAuthenticated, userToken]);
+
+  const handleCreateProduct = async (newProduct: Product) => {
+    if (!auth.isAuthenticated) {
+      alert('Acción no autorizada: Debes iniciar sesión con Microsoft Entra ID o AWS Cognito para crear productos.');
+      return;
+    }
+
+    try {
+      const created = await productService.create(newProduct, userToken);
+      setProducts((prev) => [...prev, created]);
+    } catch (err: any) {
+      alert(err.message || 'Error al guardar el producto');
+      console.error(err);
+    }
+  };
+
+  const handleDeleteProduct = async (id: number) => {
+    if (!auth.isAuthenticated) {
+      alert('Acción no autorizada: Debes iniciar sesión con Microsoft Entra ID o AWS Cognito para eliminar productos.');
+      return;
+    }
+
+    if (!window.confirm('¿Seguro que deseas eliminar este producto de la base de datos?')) {
+      return;
+    }
+
+    try {
+      await productService.delete(id, userToken);
+      setProducts((prev) => prev.filter((p) => p.id !== id));
+    } catch (err: any) {
+      alert(err.message || 'Error al eliminar el producto');
+      console.error(err);
+    }
+  };
+
+  const handleBuyProduct = async (product: Product) => {
+    if (!auth.isAuthenticated) {
+      alert('Para realizar un pedido en la tienda, primero debes iniciar sesión con Microsoft Entra ID o AWS Cognito.');
+      return;
+    }
+
+    if (!window.confirm(`¿Deseas confirmar la compra de "${product.name}" por $${product.price?.toFixed(2)}?`)) {
+      return;
+    }
+
+    try {
+      const newOrder: Order = {
+        productId: product.id!,
+        productName: product.name,
+        quantity: 1,
+        unitPrice: product.price,
+        totalAmount: product.price,
+        status: 'CONFIRMED',
+      };
+      const created = await orderService.create(newOrder, userToken);
+      setOrders((prev) => [created, ...prev]);
+
+      // Consultar despacho emitido a LavinMQ
+      const trackingCode = `TRK-CL-${(10000000 + ((created.id || 1) * 137) % 90000000)}`;
+      if (created.id) {
+        shippingService.getByOrderId(created.id).then((shp) => {
+          if (shp) {
+            setShipmentsByOrder((prev) => ({ ...prev, [created.id!]: shp }));
+          }
+        });
+      }
+
+      // Notificación visual de la emisión Tri-Broker
+      setTriBrokerNotice({
+        orderId: created.id || 1,
+        productName: product.name,
+        trackingNumber: trackingCode,
+      });
+
+      // Refrescar stock de RabbitMQ
+      setTimeout(fetchStock, 1000);
+    } catch (err: any) {
+      alert(err.message || 'Error al procesar la compra en el microservicio de órdenes');
+      console.error(err);
+    }
+  };
+
+  return (
+    <div className="app-layout">
+      <Navbar 
+        itemCount={products.length} 
+        paginaActual={pagina}
+        onCambiarPagina={setPagina}
+      />
+
+      <main className="main-content">
+        {errorMessage && (
+          <div className="error-banner">
+            <p><strong>Aviso de Conexión:</strong> {errorMessage}</p>
+            <button onClick={fetchProducts} className="btn-retry">Reintentar Conexión</button>
+          </div>
+        )}
+
+        {/* Banner de Notificación Tri-Broker Resiliente */}
+        {triBrokerNotice && (
+          <div className="tri-broker-banner">
+            <div className="tri-broker-content">
+              <div className="tri-broker-headline">
+                <span className="tri-broker-title">Compra Confirmada — Orden #{triBrokerNotice.orderId}</span>
+                <span className="tri-broker-tag">Orquestador Tri-Broker</span>
+              </div>
+              <p className="tri-broker-text">
+                El backend central emitió 3 eventos asíncronos en simultáneo:
+              </p>
+              <div className="tri-broker-event-pills">
+                <span className="event-pill pill-rabbitmq">
+                  <strong>RabbitMQ:</strong> Descontó 1 u. de stock en <code>inventory-service</code> (:8081)
+                </span>
+                <span className="event-pill pill-sqs">
+                  <strong>Amazon SQS:</strong> Encoló correo de confirmación en <code>notificaciones-service</code> (:8082)
+                </span>
+                <span className="event-pill pill-lavinmq">
+                  <strong>LavinMQ:</strong> Generó guía de despacho <strong>{triBrokerNotice.trackingNumber}</strong> en <code>shipping-service</code> (:8083)
+                </span>
+              </div>
+            </div>
+            <div className="tri-broker-actions">
+              <button
+                onClick={() => {
+                  setSelectedTrackingNumber(triBrokerNotice.trackingNumber);
+                  setPagina('envios');
+                  setTriBrokerNotice(null);
+                }}
+                className="btn-track-instant"
+              >
+                Rastrear Guía →
+              </button>
+              <button
+                onClick={() => setTriBrokerNotice(null)}
+                className="btn-close-notice"
+                title="Cerrar aviso"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 1. Vista de Bienvenida (Inicio / Home) */}
+        {pagina === 'inicio' && (
+          <div className="home-hero-container">
+            <section className="home-welcome">
+              <span className="home-badge">CloudStore — Arquitectura Tri-Broker (RabbitMQ + AWS SQS + LavinMQ)</span>
+              <h1 className="home-title">Bienvenido a Nuestra Tienda</h1>
+              <p className="home-subtitle">
+                Plataforma desacoplada de microservicios con catálogo, órdenes transaccionales, inventario sincronizado vía RabbitMQ, avisos con Amazon SQS y seguimiento logístico ultrarrápido con LavinMQ.
+              </p>
+
+              <div className="home-actions">
+                <button 
+                  className="btn-enter-store" 
+                  onClick={() => setPagina('tienda')}
+                >
+                  Explorar Tienda ({products.length} productos)
+                </button>
+
+                <button 
+                  className="btn-tracker-nav-home" 
+                  onClick={() => setPagina('envios')}
+                  title="Ver centro de rastreo de envíos en tiempo real"
+                >
+                  Centro de Envíos (LavinMQ)
+                </button>
+
+                {!auth.isAuthenticated ? (
+                  <div className="home-auth-buttons">
+                    <button 
+                      className="btn-login-ms-home" 
+                      onClick={() => auth.signinMicrosoft()}
+                      title="Iniciar sesión mediante Microsoft Entra ID"
+                    >
+                      Iniciar Sesión con Microsoft
+                    </button>
+                    <button 
+                      className="btn-cognito-home" 
+                      onClick={() => auth.signinCognito()}
+                      title="Iniciar sesión mediante AWS Cognito"
+                    >
+                      Iniciar Sesión con Cognito
+                    </button>
+                  </div>
+                ) : (
+                  <div className="home-user-badge">
+                    <span>
+                      Conectado ({auth.providerName}): <strong>{auth.user?.profile.email || auth.user?.profile.sub}</strong>
+                    </span>
+                    <button 
+                      className="btn-primary-small"
+                      onClick={() => setPagina('pedidos')}
+                    >
+                      Mis Pedidos
+                    </button>
+                    {auth.isAdmin && (
+                      <button 
+                        className="btn-primary-small"
+                        onClick={() => setPagina('inventario')}
+                      >
+                        Ir al Inventario
+                      </button>
+                    )}
+                    <button 
+                      className="btn-logout" 
+                      onClick={() => auth.removeUser()}
+                    >
+                      Cerrar sesión
+                    </button>
+                  </div>
+                )}
+              </div>
+            </section>
+
+            <div className="home-character-wrapper">
+              <img src={narutoImage} alt="Naruto" className="home-character-img" />
+              <div className="home-clouds-cluster" aria-hidden="true">
+                <img src={cloudLeft} alt="" className="home-cloud cloud-accent-left" />
+                <img src={cloudMain} alt="" className="home-cloud cloud-main-bottom" />
+                <img src={cloudRight} alt="" className="home-cloud cloud-accent-right" />
+                <img src={cloudPass1} alt="" className="home-cloud cloud-dynamic-pass-1" />
+                <img src={cloudPass2} alt="" className="home-cloud cloud-dynamic-pass-2" />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 2. Vista Pública de Tienda (Catálogo de Productos) */}
+        {pagina === 'tienda' && (
+          <section className="store-page">
+            <div className="store-header">
+              <div>
+                <h1 className="store-title">Catálogo de Productos</h1>
+                <p className="store-subtitle">
+                  Explora nuestros artículos. El stock de cada producto está sincronizado en tiempo real con <strong>inventory-service</strong> mediante <strong>RabbitMQ</strong>.
+                </p>
+              </div>
+              <div className="store-actions-top">
+                <button 
+                  onClick={() => setPagina('envios')} 
+                  className="btn-nav-to-shipping"
+                  title="Ir al módulo de despacho y seguimiento"
+                >
+                  Rastrear Envíos (LavinMQ)
+                </button>
+                <button onClick={fetchProducts} className="btn-refresh" title="Recargar catálogo">
+                  ↻ Refrescar
+                </button>
+              </div>
+            </div>
+
+            <ProductList
+              products={products}
+              isLoading={isLoading}
+              stockByProduct={stockByProduct}
+              onBuy={handleBuyProduct}
+            />
+          </section>
+        )}
+
+        {/* 3. Nueva Vista de Rastreo Logístico y Envíos (LavinMQ) */}
+        {pagina === 'envios' && (
+          <ShippingTracker
+            initialTrackingNumber={selectedTrackingNumber}
+            onGoToStore={() => setPagina('tienda')}
+          />
+        )}
+
+        {/* 4. Vista de Mis Pedidos (Historial del Usuario con Despacho de LavinMQ) */}
+        {pagina === 'pedidos' && (
+          !auth.isAuthenticated ? (
+            <section className="admin-lock-card">
+              <h2 className="lock-title">Historial de Pedidos Protegido</h2>
+              <p className="lock-description">
+                Para consultar tus compras o realizar pedidos en la tienda, debes iniciar sesión previamente con tu cuenta de <strong>Microsoft Entra ID</strong> o <strong>AWS Cognito</strong>.
+              </p>
+              <div className="lock-auth-buttons">
+                <button 
+                  className="btn-login-ms-home" 
+                  onClick={() => auth.signinMicrosoft()}
+                >
+                  Iniciar Sesión con Microsoft
+                </button>
+                <button 
+                  className="btn-cognito-home" 
+                  onClick={() => auth.signinCognito()}
+                >
+                  Iniciar Sesión con Cognito
+                </button>
+              </div>
+            </section>
+          ) : (
+            <section className="orders-page">
+              <div className="orders-header">
+                <div>
+                  <h1 className="orders-title">Mis Pedidos</h1>
+                  <p className="orders-subtitle">
+                    Compras registradas en el microservicio de órdenes para: <strong>{auth.user?.profile.email || auth.user?.profile.sub}</strong>
+                  </p>
+                </div>
+                <div className="orders-header-actions">
+                  <button onClick={() => setPagina('envios')} className="btn-tracker-nav-home">
+                    Centro de Rastreo
+                  </button>
+                  <button onClick={() => setPagina('tienda')} className="btn-enter-store-small">
+                    + Comprar Más Artículos
+                  </button>
+                  <button onClick={fetchOrders} className="btn-refresh" title="Recargar pedidos">
+                    ↻ Refrescar
+                  </button>
+                </div>
+              </div>
+
+              {isLoadingOrders ? (
+                <div className="loading-state">Cargando pedidos desde el microservicio...</div>
+              ) : orders.length === 0 ? (
+                <div className="empty-state">
+                  <p>Aún no has registrado pedidos con esta cuenta.</p>
+                  <span>Visita la Tienda y haz clic en "Comprar" en cualquiera de los productos disponibles.</span>
+                  <button onClick={() => setPagina('tienda')} className="btn-primary-small" style={{ marginTop: '1rem' }}>
+                    Ir a la Tienda
+                  </button>
+                </div>
+              ) : (
+                <div className="orders-grid">
+                  {orders.map((order) => {
+                    const fallbackCode = `TRK-CL-${(10000000 + ((order.id || 1) * 137) % 90000000)}`;
+                    const shipment = order.id ? shipmentsByOrder[order.id] : undefined;
+                    const trackingNumber = shipment?.trackingNumber || fallbackCode;
+                    const shippingStatus = shipment?.status || 'PREPARING';
+
+                    return (
+                      <div key={order.id} className="order-card">
+                        <div className="order-card-header">
+                          <span className="order-id">Orden #{order.id}</span>
+                          <span className="order-status-badge">
+                            {order.status || 'CONFIRMADO'}
+                          </span>
+                        </div>
+                        <h3 className="order-product-title">{order.productName || `Producto #${order.productId}`}</h3>
+                        
+                        <div className="order-meta-info">
+                          <p>Cantidad: <strong>{order.quantity || 1}</strong></p>
+                          <p>Precio Unitario: <strong>${order.unitPrice?.toFixed(2)}</strong></p>
+                          <p className="order-total-price">Total: <strong>${order.totalAmount?.toFixed(2)}</strong></p>
+                        </div>
+
+                        {/* Bloque Logístico de LavinMQ en la Orden */}
+                        <div className="order-shipping-block">
+                          <div className="order-shipping-top">
+                            <span className="shipping-broker-tag">LavinMQ Envíos</span>
+                            <span className={`order-shipping-pill pill-${shippingStatus.toLowerCase()}`}>
+                              {shippingStatus === 'PREPARING' && 'Preparación'}
+                              {shippingStatus === 'IN_TRANSIT' && 'En Tránsito'}
+                              {shippingStatus === 'DELIVERED' && 'Entregado'}
+                            </span>
+                          </div>
+                          
+                          <div className="order-shipping-code-wrap">
+                            <span className="code-label">Guía de Despacho:</span>
+                            <span className="code-value">{trackingNumber}</span>
+                          </div>
+
+                          <button
+                            className="btn-view-tracking"
+                            onClick={() => {
+                              setSelectedTrackingNumber(trackingNumber);
+                              setPagina('envios');
+                            }}
+                            title="Ver seguimiento detallado en el centro logístico"
+                          >
+                            Ver Rastreo →
+                          </button>
+                        </div>
+
+                        <div className="order-footer">
+                          <span className="order-date">
+                            {order.createdAt ? new Date(order.createdAt).toLocaleString('es-CL') : 'Recién creada'}
+                          </span>
+                          <span className="order-provider-tag">{auth.providerName}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          )
+        )}
+
+        {/* 5. Vista de Administración de Inventario (Solo con cuenta logueada y rol Admin) */}
+        {pagina === 'inventario' && (
+          !auth.isAuthenticated ? (
+            <section className="admin-lock-card">
+              <h2 className="lock-title">Acceso Restringido a Administradores</h2>
+              <p className="lock-description">
+                La sección de <strong>Administrar Inventario</strong> permite dar de alta y eliminar artículos. 
+                Para acceder a estas herramientas debes iniciar sesión previamente con tu cuenta de <strong>Microsoft Entra ID</strong> o <strong>AWS Cognito</strong>.
+              </p>
+              <div className="lock-auth-buttons">
+                <button 
+                  className="btn-login-ms-home" 
+                  onClick={() => auth.signinMicrosoft()}
+                >
+                  Iniciar Sesión con Microsoft
+                </button>
+                <button 
+                  className="btn-cognito-home" 
+                  onClick={() => auth.signinCognito()}
+                >
+                  Iniciar Sesión con Cognito
+                </button>
+              </div>
+            </section>
+          ) : (
+            <div className="content-grid">
+              <section className="column-form">
+                <ProductForm onProductCreated={handleCreateProduct} />
+              </section>
+
+              <section className="column-list">
+                <div className="list-header">
+                  <h3>Inventario de Productos Persistidos</h3>
+                  <button onClick={fetchProducts} className="btn-refresh" title="Recargar">
+                    ↻ Refrescar
+                  </button>
+                </div>
+                <ProductList
+                  products={products}
+                  isLoading={isLoading}
+                  stockByProduct={stockByProduct}
+                  onDelete={handleDeleteProduct}
+                />
+              </section>
+            </div>
+          )
+        )}
+      </main>
+    </div>
+  );
+}
+
+export default App;
